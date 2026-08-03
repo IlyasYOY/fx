@@ -40,12 +40,26 @@ type (
 	parallelGrouped   struct{}
 	parallelConsumer  struct{}
 	parallelPrivate   struct{}
+	parallelTrigger   struct{}
 )
 
 type parallelGroupParams struct {
 	In
 
 	Items []*parallelGrouped `group:"parallel"`
+}
+
+type parallelSoftGroupParams struct {
+	In
+
+	Items []*parallelGrouped `group:"parallel-soft,soft"`
+}
+
+type parallelSoftGroupResult struct {
+	Out
+
+	Item    *parallelGrouped `group:"parallel-soft"`
+	Trigger *parallelTrigger
 }
 
 func TestParallelHooksOption(t *testing.T) {
@@ -311,6 +325,47 @@ func TestParallelHooksTrackAnnotatedAndGroupedDependencies(t *testing.T) {
 	require.NoError(t, app.Err())
 	require.NoError(t, app.Start(t.Context()))
 	require.NoError(t, app.Stop(t.Context()))
+}
+
+func TestParallelHooksDoNotWaitForUnresolvedSoftGroupProviders(t *testing.T) {
+	t.Parallel()
+
+	consumerStarted := make(chan struct{})
+	app := New(
+		NopLogger,
+		ParallelHooks(2),
+		Provide(
+			func(lc Lifecycle, _ parallelSoftGroupParams) *parallelConsumer {
+				lc.Append(Hook{OnStart: func(context.Context) error {
+					close(consumerStarted)
+					return nil
+				}})
+				return new(parallelConsumer)
+			},
+			func(lc Lifecycle) parallelSoftGroupResult {
+				lc.Append(Hook{OnStart: func(ctx context.Context) error {
+					select {
+					case <-consumerStarted:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}})
+				return parallelSoftGroupResult{
+					Item:    new(parallelGrouped),
+					Trigger: new(parallelTrigger),
+				}
+			},
+		),
+		Invoke(func(*parallelConsumer) {}),
+		Invoke(func(*parallelTrigger) {}),
+	)
+	require.NoError(t, app.Err())
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	require.NoError(t, app.Start(ctx))
+	require.NoError(t, app.Stop(ctx))
 }
 
 func TestParallelHooksTrackPrivateModuleDependencies(t *testing.T) {

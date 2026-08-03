@@ -45,12 +45,13 @@ const (
 )
 
 type hookComponent struct {
-	id          int
-	kind        hookComponentKind
-	scope       *hookScope
-	outputScope *hookScope
-	inputs      []hookInput
-	outputs     []string
+	id                int
+	kind              hookComponentKind
+	scope             *hookScope
+	outputScope       *hookScope
+	inputs            []hookInput
+	outputs           []string
+	constructionOrder int
 }
 
 // hookGraph mirrors the portion of Dig's graph needed to order lifecycle
@@ -59,9 +60,10 @@ type hookComponent struct {
 type hookGraph struct {
 	mu sync.Mutex
 
-	root       *hookScope
-	components []*hookComponent
-	owners     []int
+	root        *hookScope
+	components  []*hookComponent
+	owners      []int
+	constructed int
 }
 
 func newHookGraph() *hookGraph {
@@ -98,6 +100,10 @@ func (g *hookGraph) end(c *hookComponent) {
 
 	if n := len(g.owners); n > 0 && g.owners[n-1] == c.id {
 		g.owners = g.owners[:n-1]
+	}
+	if c.constructionOrder == 0 {
+		g.constructed++
+		c.constructionOrder = g.constructed
 	}
 }
 
@@ -207,7 +213,7 @@ func (g *hookGraph) dependencies() map[int][]int {
 	for _, c := range g.components {
 		seen := make(map[int]struct{})
 		for _, input := range c.inputs {
-			for _, dep := range resolveHookInput(c, input, providers, decorators) {
+			for _, dep := range resolveHookInput(c, input, providers, decorators, g.components) {
 				if dep == c.id {
 					continue
 				}
@@ -226,11 +232,14 @@ func resolveHookInput(
 	input hookInput,
 	providers map[*hookScope]map[string][]int,
 	decorators map[*hookScope]map[string]int,
+	components []*hookComponent,
 ) []int {
 	var found []int
 	for scope := c.scope; scope != nil; scope = scope.parent {
 		if decorator := decorators[scope][input.key]; decorator != 0 && decorator != c.id {
-			found = append(found, decorator)
+			if !input.group || constructedBefore(components, decorator, c) {
+				found = append(found, decorator)
+			}
 			if !input.group {
 				return found
 			}
@@ -242,11 +251,26 @@ func resolveHookInput(
 
 	for scope := c.scope; scope != nil; scope = scope.parent {
 		if scoped := providers[scope][input.key]; len(scoped) > 0 {
-			found = append(found, scoped...)
+			for _, provider := range scoped {
+				if !input.group || constructedBefore(components, provider, c) {
+					found = append(found, provider)
+				}
+			}
 			if !input.group {
 				return found
 			}
 		}
 	}
 	return found
+}
+
+func constructedBefore(components []*hookComponent, dependency int, dependent *hookComponent) bool {
+	if dependency <= 0 || dependency > len(components) {
+		return false
+	}
+	// Dig constructs every hard group provider before its consumer. A soft
+	// group may leave registered providers unconstructed until a later invoke;
+	// those providers did not contribute a value to this consumer.
+	order := components[dependency-1].constructionOrder
+	return order > 0 && order < dependent.constructionOrder
 }
