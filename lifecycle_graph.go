@@ -147,7 +147,7 @@ func (g *hookGraph) setInvokeInfo(c *hookComponent, info dig.InvokeInfo) {
 func hookInputs(inputs []*dig.Input) []hookInput {
 	result := make([]hookInput, 0, len(inputs))
 	for _, input := range inputs {
-		key, group := normalizeHookKey(input.String(), true)
+		key, group := normalizeHookKey(input.String())
 		result = append(result, hookInput{key: key, group: group})
 	}
 	return result
@@ -156,17 +156,17 @@ func hookInputs(inputs []*dig.Input) []hookInput {
 func hookOutputs(outputs []*dig.Output) []string {
 	result := make([]string, 0, len(outputs))
 	for _, output := range outputs {
-		key, _ := normalizeHookKey(output.String(), false)
+		key, _ := normalizeHookKey(output.String())
 		result = append(result, key)
 	}
 	return result
 }
 
-func normalizeHookKey(key string, input bool) (string, bool) {
+func normalizeHookKey(key string) (string, bool) {
 	group := strings.Contains(key, "[group = ")
 	key = strings.Replace(key, "[optional, ", "[", 1)
 	key = strings.Replace(key, "[optional]", "", 1)
-	if input && group {
+	if group {
 		key = strings.TrimPrefix(key, "[]")
 	}
 	return key, group

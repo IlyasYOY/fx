@@ -62,6 +62,12 @@ type parallelSoftGroupResult struct {
 	Trigger *parallelTrigger
 }
 
+type parallelDecoratedGroupResult struct {
+	Out
+
+	Items []*parallelGrouped `group:"parallel"`
+}
+
 func TestParallelHooksOption(t *testing.T) {
 	t.Parallel()
 
@@ -325,6 +331,87 @@ func TestParallelHooksTrackAnnotatedAndGroupedDependencies(t *testing.T) {
 	require.NoError(t, app.Err())
 	require.NoError(t, app.Start(t.Context()))
 	require.NoError(t, app.Stop(t.Context()))
+}
+
+func TestParallelHooksTrackDecoratedGroupDependencies(t *testing.T) {
+	t.Parallel()
+
+	decoratorStartStarted := make(chan struct{})
+	releaseDecoratorStart := make(chan struct{})
+	consumerStartStarted := make(chan struct{})
+	consumerStopStarted := make(chan struct{})
+	releaseConsumerStop := make(chan struct{})
+	decoratorStopStarted := make(chan struct{})
+
+	app := New(
+		NopLogger,
+		ParallelHooks(2),
+		Provide(
+			Annotate(
+				func() *parallelGrouped { return new(parallelGrouped) },
+				ResultTags(`group:"parallel"`),
+			),
+			func(lc Lifecycle, _ parallelGroupParams) *parallelConsumer {
+				lc.Append(Hook{
+					OnStart: func(context.Context) error {
+						close(consumerStartStarted)
+						return nil
+					},
+					OnStop: func(context.Context) error {
+						close(consumerStopStarted)
+						<-releaseConsumerStop
+						return nil
+					},
+				})
+				return new(parallelConsumer)
+			},
+		),
+		Decorate(func(lc Lifecycle, group parallelGroupParams) parallelDecoratedGroupResult {
+			lc.Append(Hook{
+				OnStart: func(context.Context) error {
+					close(decoratorStartStarted)
+					<-releaseDecoratorStart
+					return nil
+				},
+				OnStop: func(context.Context) error {
+					close(decoratorStopStarted)
+					return nil
+				},
+			})
+			return parallelDecoratedGroupResult{Items: group.Items}
+		}),
+		Invoke(func(*parallelConsumer) {}),
+	)
+	require.NoError(t, app.Err())
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+
+	started := make(chan error, 1)
+	go func() { started <- app.Start(ctx) }()
+	<-decoratorStartStarted
+	consumerStartedEarly := false
+	select {
+	case <-consumerStartStarted:
+		consumerStartedEarly = true
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseDecoratorStart)
+	require.NoError(t, <-started)
+	assert.False(t, consumerStartedEarly, "group consumer started before its decorator completed")
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- app.Stop(ctx) }()
+	<-consumerStopStarted
+	decoratorStoppedEarly := false
+	select {
+	case <-decoratorStopStarted:
+		decoratorStoppedEarly = true
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseConsumerStop)
+	require.NoError(t, <-stopped)
+	assert.False(t, decoratorStoppedEarly, "group decorator stopped before its consumer completed")
 }
 
 func TestParallelHooksDoNotWaitForUnresolvedSoftGroupProviders(t *testing.T) {
