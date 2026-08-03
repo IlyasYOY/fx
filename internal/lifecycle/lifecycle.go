@@ -417,7 +417,9 @@ func (l *Lifecycle) logEvent(event fxevent.Event) {
 }
 
 type hookPart struct {
+	// indices contains the positions of owned hooks preceding the barrier.
 	indices []int
+	// barrier is the position of the following ownerless hook, or -1 if absent.
 	barrier int
 }
 
@@ -462,6 +464,10 @@ func (l *Lifecycle) startParallel(ctx context.Context) error {
 	return nil
 }
 
+// runStartSegment starts the owned hooks at indices, respecting owner
+// dependencies and the parallelism limit. Hooks belonging to the same owner run
+// sequentially. After a hook fails, it waits for running owners to finish but
+// does not start any more owners.
 func (l *Lifecycle) runStartSegment(
 	ctx context.Context,
 	hooks []hookEntry,
@@ -519,6 +525,8 @@ func (l *Lifecycle) runStartSegment(
 	return errs, nil
 }
 
+// runStartOwner starts an owner's hooks sequentially in append order. It stops
+// at the first hook or context error and records each successful start.
 func (l *Lifecycle) runStartOwner(
 	ctx context.Context,
 	hooks []hookEntry,
@@ -688,6 +696,10 @@ func (l *Lifecycle) runStopOwner(
 	return result
 }
 
+// splitHookParts divides hooks into ordered parts of owned hooks followed by an
+// optional ownerless barrier hook. Barriers keep ownerless hooks in append order
+// while allowing the owned hooks between them to be scheduled in parallel. A
+// trailing group of owned hooks has a barrier index of -1.
 func splitHookParts(hooks []hookEntry) []hookPart {
 	var (
 		parts   []hookPart
@@ -723,6 +735,11 @@ func groupHookIndices(hooks []hookEntry, indices []int) map[int][]int {
 	return jobs
 }
 
+// lifecycleOwnerDependencies returns the lifecycle owners that each owner must
+// wait for. It walks transitively through components without hooks, stopping at
+// the first component on each path that owns hooks. The result contains only
+// owners with hooks, excludes self-dependencies, and sorts each dependency list
+// for deterministic scheduling.
 func lifecycleOwnerDependencies(hooks []hookEntry, dependencies map[int][]int) map[int][]int {
 	hasHooks := make(map[int]bool)
 	for _, hook := range hooks {
