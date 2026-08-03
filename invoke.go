@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"strings"
 
+	"go.uber.org/dig"
 	"go.uber.org/fx/internal/fxreflect"
 )
 
@@ -90,7 +91,7 @@ func (o invokeOption) String() string {
 	return fmt.Sprintf("fx.Invoke(%s)", strings.Join(items, ", "))
 }
 
-func runInvoke(c container, i invoke) error {
+func runInvoke(c container, i invoke, opts ...dig.InvokeOption) error {
 	fn := i.Target
 	switch fn := fn.(type) {
 	case Option:
@@ -104,8 +105,8 @@ func runInvoke(c container, i invoke) error {
 			return err
 		}
 
-		return c.Invoke(af)
+		return c.Invoke(af, opts...)
 	default:
-		return c.Invoke(fn)
+		return c.Invoke(fn, opts...)
 	}
 }

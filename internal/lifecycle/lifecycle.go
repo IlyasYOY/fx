@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -155,30 +156,66 @@ type Lifecycle struct {
 	clock        fxclock.Clock
 	logger       fxevent.Logger
 	state        appState
-	hooks        []Hook
+	hooks        []hookEntry
 	numStarted   int
 	startRecords HookRecords
 	stopRecords  HookRecords
 	runningHook  Hook
+	parallelism  int
+	dependencies map[int][]int
 	mu           sync.Mutex
+	eventMu      sync.Mutex
+}
+
+type hookEntry struct {
+	Hook
+	owner   int
+	started bool
 }
 
 // New constructs a new Lifecycle.
 func New(logger fxevent.Logger, clock fxclock.Clock) *Lifecycle {
-	return &Lifecycle{logger: logger, clock: clock}
+	return &Lifecycle{logger: logger, clock: clock, parallelism: 1}
 }
 
 // Append adds a Hook to the lifecycle.
 func (l *Lifecycle) Append(hook Hook) {
+	l.AppendWithOwner(hook, 0)
+}
+
+// AppendWithOwner adds a Hook associated with a dependency graph component.
+// An owner of zero marks a hook whose graph ownership is unknown.
+func (l *Lifecycle) AppendWithOwner(hook Hook, owner int) {
 	// Save the caller's stack frame to report file/line number.
 	if f := fxreflect.CallerStack(2, 0); len(f) > 0 {
 		hook.callerFrame = f[0]
 	}
-	l.hooks = append(l.hooks, hook)
+	l.mu.Lock()
+	l.hooks = append(l.hooks, hookEntry{Hook: hook, owner: owner})
+	l.mu.Unlock()
 }
 
-// Start runs all OnStart hooks, returning immediately if it encounters an
-// error.
+// SetParallelism sets the maximum number of hooks that may execute at once.
+func (l *Lifecycle) SetParallelism(parallelism int) {
+	l.mu.Lock()
+	l.parallelism = parallelism
+	l.mu.Unlock()
+}
+
+// SetDependencies replaces the component dependency graph. Each map key is a
+// component and each value lists the components it depends on.
+func (l *Lifecycle) SetDependencies(dependencies map[int][]int) {
+	cloned := make(map[int][]int, len(dependencies))
+	for component, deps := range dependencies {
+		cloned[component] = append([]int(nil), deps...)
+	}
+	l.mu.Lock()
+	l.dependencies = cloned
+	l.mu.Unlock()
+}
+
+// Start runs all OnStart hooks. In parallel mode, it stops scheduling new
+// hooks after an error and waits for hooks that are already running.
 func (l *Lifecycle) Start(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("called OnStart with nil context")
@@ -193,6 +230,10 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.state = starting
 
 	l.startRecords = make(HookRecords, 0, len(l.hooks))
+	for i := range l.hooks {
+		l.hooks[i].started = false
+	}
+	parallelism := l.parallelism
 	l.mu.Unlock()
 
 	returnState := incompleteStart
@@ -202,12 +243,32 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		l.mu.Unlock()
 	}()
 
-	for _, hook := range l.hooks {
+	var err error
+	if parallelism > 1 {
+		err = l.startParallel(ctx)
+	} else {
+		err = l.startSequential(ctx)
+	}
+	if err != nil {
+		return err
+	}
+
+	returnState = started
+	return nil
+}
+
+func (l *Lifecycle) startSequential(ctx context.Context) error {
+	l.mu.Lock()
+	hooks := append([]hookEntry(nil), l.hooks...)
+	l.mu.Unlock()
+
+	for i, entry := range hooks {
 		// if ctx has cancelled, bail out of the loop.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
+		hook := entry.Hook
 		if hook.OnStart != nil {
 			l.mu.Lock()
 			l.runningHook = hook
@@ -226,10 +287,11 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			})
 			l.mu.Unlock()
 		}
+		l.mu.Lock()
+		l.hooks[i].started = true
 		l.numStarted++
+		l.mu.Unlock()
 	}
-
-	returnState = started
 	return nil
 }
 
@@ -239,12 +301,12 @@ func (l *Lifecycle) runStartHook(ctx context.Context, hook Hook) (runtime time.D
 		funcName = fxreflect.FuncName(hook.OnStart)
 	}
 
-	l.logger.LogEvent(&fxevent.OnStartExecuting{
+	l.logEvent(&fxevent.OnStartExecuting{
 		CallerName:   hook.callerFrame.Function,
 		FunctionName: funcName,
 	})
 	defer func() {
-		l.logger.LogEvent(&fxevent.OnStartExecuted{
+		l.logEvent(&fxevent.OnStartExecuted{
 			CallerName:   hook.callerFrame.Function,
 			FunctionName: funcName,
 			Runtime:      runtime,
@@ -270,6 +332,7 @@ func (l *Lifecycle) Stop(ctx context.Context) error {
 		return nil
 	}
 	l.state = stopping
+	parallelism := l.parallelism
 	l.mu.Unlock()
 
 	defer func() {
@@ -278,20 +341,25 @@ func (l *Lifecycle) Stop(ctx context.Context) error {
 		l.mu.Unlock()
 	}()
 
+	if parallelism > 1 {
+		return l.stopParallel(ctx)
+	}
+	return l.stopSequential(ctx)
+}
+
+func (l *Lifecycle) stopSequential(ctx context.Context) error {
 	l.mu.Lock()
 	l.stopRecords = make(HookRecords, 0, l.numStarted)
-	// Take a snapshot of hook state to avoid races.
-	allHooks := l.hooks[:]
+	allHooks := append([]hookEntry(nil), l.hooks...)
 	numStarted := l.numStarted
 	l.mu.Unlock()
 
-	// Run backward from last successful OnStart.
 	var errs []error
 	for ; numStarted > 0; numStarted-- {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		hook := allHooks[numStarted-1]
+		hook := allHooks[numStarted-1].Hook
 		if hook.OnStop == nil {
 			continue
 		}
@@ -324,12 +392,12 @@ func (l *Lifecycle) runStopHook(ctx context.Context, hook Hook) (runtime time.Du
 		funcName = fxreflect.FuncName(hook.OnStop)
 	}
 
-	l.logger.LogEvent(&fxevent.OnStopExecuting{
+	l.logEvent(&fxevent.OnStopExecuting{
 		CallerName:   hook.callerFrame.Function,
 		FunctionName: funcName,
 	})
 	defer func() {
-		l.logger.LogEvent(&fxevent.OnStopExecuted{
+		l.logEvent(&fxevent.OnStopExecuted{
 			CallerName:   hook.callerFrame.Function,
 			FunctionName: funcName,
 			Runtime:      runtime,
@@ -340,6 +408,423 @@ func (l *Lifecycle) runStopHook(ctx context.Context, hook Hook) (runtime time.Du
 	begin := l.clock.Now()
 	err = hook.OnStop(ctx)
 	return l.clock.Since(begin), err
+}
+
+func (l *Lifecycle) logEvent(event fxevent.Event) {
+	l.eventMu.Lock()
+	l.logger.LogEvent(event)
+	l.eventMu.Unlock()
+}
+
+type hookPart struct {
+	indices []int
+	barrier int
+}
+
+type indexedError struct {
+	index int
+	err   error
+}
+
+type ownerResult struct {
+	owner int
+	errs  []indexedError
+}
+
+func (l *Lifecycle) startParallel(ctx context.Context) error {
+	l.mu.Lock()
+	hooks := append([]hookEntry(nil), l.hooks...)
+	dependencies := cloneDependencies(l.dependencies)
+	parallelism := l.parallelism
+	l.mu.Unlock()
+
+	ownerDeps := lifecycleOwnerDependencies(hooks, dependencies)
+	for _, part := range splitHookParts(hooks) {
+		if len(part.indices) > 0 {
+			errs, err := l.runStartSegment(ctx, hooks, part.indices, ownerDeps, parallelism)
+			if err != nil {
+				return err
+			}
+			if len(errs) > 0 {
+				return combineIndexedErrors(errs, false)
+			}
+		}
+		if part.barrier >= 0 {
+			result := l.runStartOwner(ctx, hooks, []int{part.barrier}, 0)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if len(result.errs) > 0 {
+				return combineIndexedErrors(result.errs, false)
+			}
+		}
+	}
+	return nil
+}
+
+func (l *Lifecycle) runStartSegment(
+	ctx context.Context,
+	hooks []hookEntry,
+	indices []int,
+	ownerDeps map[int][]int,
+	parallelism int,
+) ([]indexedError, error) {
+	jobs := groupHookIndices(hooks, indices)
+	indegree, next := segmentEdges(jobs, ownerDeps, false)
+	ready := readyOwners(jobs, indegree, false)
+	results := make(chan ownerResult, len(jobs))
+
+	var (
+		running  int
+		launched int
+		failed   bool
+		errs     []indexedError
+	)
+	for running > 0 || (!failed && len(ready) > 0) {
+		for !failed && ctx.Err() == nil && running < parallelism && len(ready) > 0 {
+			owner := ready[0]
+			ready = ready[1:]
+			running++
+			launched++
+			go func() {
+				results <- l.runStartOwner(ctx, hooks, jobs[owner], owner)
+			}()
+		}
+
+		if running == 0 {
+			break
+		}
+		result := <-results
+		running--
+		if len(result.errs) > 0 {
+			failed = true
+			errs = append(errs, result.errs...)
+			continue
+		}
+		for _, dependent := range next[result.owner] {
+			indegree[dependent]--
+			if indegree[dependent] == 0 {
+				ready = append(ready, dependent)
+			}
+		}
+		sortOwners(ready, jobs, false)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !failed && launched != len(jobs) {
+		return nil, errors.New("lifecycle hook dependency graph contains a cycle")
+	}
+	return errs, nil
+}
+
+func (l *Lifecycle) runStartOwner(
+	ctx context.Context,
+	hooks []hookEntry,
+	indices []int,
+	owner int,
+) ownerResult {
+	result := ownerResult{owner: owner}
+	for _, index := range indices {
+		if err := ctx.Err(); err != nil {
+			result.errs = append(result.errs, indexedError{index: index, err: err})
+			return result
+		}
+
+		hook := hooks[index].Hook
+		if hook.OnStart != nil {
+			l.mu.Lock()
+			l.runningHook = hook
+			l.mu.Unlock()
+
+			runtime, err := l.runStartHook(ctx, hook)
+			if err != nil {
+				result.errs = append(result.errs, indexedError{index: index, err: err})
+				return result
+			}
+			l.mu.Lock()
+			l.startRecords = append(l.startRecords, HookRecord{
+				CallerFrame: hook.callerFrame,
+				Func:        hook.OnStart,
+				Runtime:     runtime,
+			})
+			l.mu.Unlock()
+		}
+
+		l.mu.Lock()
+		if index < len(l.hooks) {
+			l.hooks[index].started = true
+		}
+		l.numStarted++
+		l.mu.Unlock()
+	}
+	return result
+}
+
+func (l *Lifecycle) stopParallel(ctx context.Context) error {
+	l.mu.Lock()
+	hooks := append([]hookEntry(nil), l.hooks...)
+	dependencies := cloneDependencies(l.dependencies)
+	parallelism := l.parallelism
+	l.stopRecords = make(HookRecords, 0, len(hooks))
+	l.mu.Unlock()
+
+	ownerDeps := lifecycleOwnerDependencies(hooks, dependencies)
+	parts := splitHookParts(hooks)
+	var errs []indexedError
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := parts[i]
+		if part.barrier >= 0 && hooks[part.barrier].started {
+			result := l.runStopOwner(ctx, hooks, []int{part.barrier}, 0)
+			errs = append(errs, result.errs...)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+
+		started := part.indices[:0]
+		for _, index := range part.indices {
+			if hooks[index].started {
+				started = append(started, index)
+			}
+		}
+		if len(started) == 0 {
+			continue
+		}
+		segmentErrs, err := l.runStopSegment(ctx, hooks, started, ownerDeps, parallelism)
+		if err != nil {
+			return err
+		}
+		errs = append(errs, segmentErrs...)
+	}
+	return combineIndexedErrors(errs, true)
+}
+
+func (l *Lifecycle) runStopSegment(
+	ctx context.Context,
+	hooks []hookEntry,
+	indices []int,
+	ownerDeps map[int][]int,
+	parallelism int,
+) ([]indexedError, error) {
+	jobs := groupHookIndices(hooks, indices)
+	indegree, next := segmentEdges(jobs, ownerDeps, true)
+	ready := readyOwners(jobs, indegree, true)
+	results := make(chan ownerResult, len(jobs))
+	var (
+		running   int
+		completed int
+		errs      []indexedError
+	)
+	for running > 0 || len(ready) > 0 {
+		for ctx.Err() == nil && running < parallelism && len(ready) > 0 {
+			owner := ready[0]
+			ready = ready[1:]
+			running++
+			go func() {
+				results <- l.runStopOwner(ctx, hooks, jobs[owner], owner)
+			}()
+		}
+		if running == 0 {
+			break
+		}
+
+		result := <-results
+		running--
+		completed++
+		errs = append(errs, result.errs...)
+		for _, dependent := range next[result.owner] {
+			indegree[dependent]--
+			if indegree[dependent] == 0 {
+				ready = append(ready, dependent)
+			}
+		}
+		sortOwners(ready, jobs, true)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if completed != len(jobs) {
+		return nil, errors.New("lifecycle hook dependency graph contains a cycle")
+	}
+	return errs, nil
+}
+
+func (l *Lifecycle) runStopOwner(
+	ctx context.Context,
+	hooks []hookEntry,
+	indices []int,
+	owner int,
+) ownerResult {
+	result := ownerResult{owner: owner}
+	for i := len(indices) - 1; i >= 0; i-- {
+		index := indices[i]
+		if err := ctx.Err(); err != nil {
+			result.errs = append(result.errs, indexedError{index: index, err: err})
+			return result
+		}
+
+		hook := hooks[index].Hook
+		if hook.OnStop == nil {
+			continue
+		}
+		l.mu.Lock()
+		l.runningHook = hook
+		l.mu.Unlock()
+
+		runtime, err := l.runStopHook(ctx, hook)
+		if err != nil {
+			result.errs = append(result.errs, indexedError{index: index, err: err})
+		}
+		l.mu.Lock()
+		l.stopRecords = append(l.stopRecords, HookRecord{
+			CallerFrame: hook.callerFrame,
+			Func:        hook.OnStop,
+			Runtime:     runtime,
+		})
+		l.mu.Unlock()
+	}
+	return result
+}
+
+func splitHookParts(hooks []hookEntry) []hookPart {
+	var (
+		parts   []hookPart
+		indices []int
+	)
+	flush := func(barrier int) {
+		if len(indices) == 0 && barrier < 0 {
+			return
+		}
+		parts = append(parts, hookPart{
+			indices: append([]int(nil), indices...),
+			barrier: barrier,
+		})
+		indices = indices[:0]
+	}
+	for index, hook := range hooks {
+		if hook.owner == 0 {
+			flush(index)
+			continue
+		}
+		indices = append(indices, index)
+	}
+	flush(-1)
+	return parts
+}
+
+func groupHookIndices(hooks []hookEntry, indices []int) map[int][]int {
+	jobs := make(map[int][]int)
+	for _, index := range indices {
+		owner := hooks[index].owner
+		jobs[owner] = append(jobs[owner], index)
+	}
+	return jobs
+}
+
+func lifecycleOwnerDependencies(hooks []hookEntry, dependencies map[int][]int) map[int][]int {
+	hasHooks := make(map[int]bool)
+	for _, hook := range hooks {
+		if hook.owner > 0 {
+			hasHooks[hook.owner] = true
+		}
+	}
+
+	result := make(map[int][]int, len(hasHooks))
+	for owner := range hasHooks {
+		seen := make(map[int]bool)
+		var visit func(int)
+		visit = func(component int) {
+			for _, dependency := range dependencies[component] {
+				if dependency == owner || seen[dependency] {
+					continue
+				}
+				seen[dependency] = true
+				if hasHooks[dependency] {
+					result[owner] = append(result[owner], dependency)
+					continue
+				}
+				visit(dependency)
+			}
+		}
+		visit(owner)
+		sort.Ints(result[owner])
+	}
+	return result
+}
+
+func segmentEdges(
+	jobs map[int][]int,
+	ownerDeps map[int][]int,
+	reverse bool,
+) (map[int]int, map[int][]int) {
+	indegree := make(map[int]int, len(jobs))
+	next := make(map[int][]int, len(jobs))
+	for owner := range jobs {
+		indegree[owner] = 0
+	}
+	for owner := range jobs {
+		for _, dependency := range ownerDeps[owner] {
+			if _, ok := jobs[dependency]; !ok {
+				continue
+			}
+			from, to := dependency, owner
+			if reverse {
+				from, to = to, from
+			}
+			next[from] = append(next[from], to)
+			indegree[to]++
+		}
+	}
+	return indegree, next
+}
+
+func readyOwners(jobs map[int][]int, indegree map[int]int, reverse bool) []int {
+	ready := make([]int, 0, len(jobs))
+	for owner := range jobs {
+		if indegree[owner] == 0 {
+			ready = append(ready, owner)
+		}
+	}
+	sortOwners(ready, jobs, reverse)
+	return ready
+}
+
+func sortOwners(owners []int, jobs map[int][]int, reverse bool) {
+	sort.Slice(owners, func(i, j int) bool {
+		left := jobs[owners[i]][0]
+		right := jobs[owners[j]][0]
+		if reverse {
+			return left > right
+		}
+		return left < right
+	})
+}
+
+func combineIndexedErrors(errs []indexedError, reverse bool) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	sort.SliceStable(errs, func(i, j int) bool {
+		if reverse {
+			return errs[i].index > errs[j].index
+		}
+		return errs[i].index < errs[j].index
+	})
+	combined := make([]error, 0, len(errs))
+	for _, indexed := range errs {
+		combined = append(combined, indexed.err)
+	}
+	return multierr.Combine(combined...)
+}
+
+func cloneDependencies(dependencies map[int][]int) map[int][]int {
+	cloned := make(map[int][]int, len(dependencies))
+	for component, deps := range dependencies {
+		cloned[component] = append([]int(nil), deps...)
+	}
+	return cloned
 }
 
 // RunningHookCaller returns the name of the hook that was running when a Start/Stop

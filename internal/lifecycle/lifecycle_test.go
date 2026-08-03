@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -328,6 +329,249 @@ func TestLifecycleStop(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "called OnStop with nil context")
 	})
+}
+
+func TestLifecycleParallelDependencyOrder(t *testing.T) {
+	t.Parallel()
+
+	l := New(testLogger(t), fxclock.System)
+	l.SetParallelism(2)
+	l.SetDependencies(map[int][]int{3: {1, 2}})
+
+	branchesReady := make(chan struct{})
+	var ready int
+	var mu sync.Mutex
+	done := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	for i := range 2 {
+		i := i
+		l.AppendWithOwner(Hook{OnStart: func(context.Context) error {
+			mu.Lock()
+			ready++
+			if ready == 2 {
+				close(branchesReady)
+			}
+			mu.Unlock()
+			<-branchesReady
+			close(done[i])
+			return nil
+		}}, i+1)
+	}
+
+	l.AppendWithOwner(Hook{OnStart: func(context.Context) error {
+		for i := range done {
+			select {
+			case <-done[i]:
+			default:
+				return fmt.Errorf("dependency %d has not started", i)
+			}
+		}
+		return nil
+	}}, 3)
+
+	require.NoError(t, l.Start(t.Context()))
+	require.NoError(t, l.Stop(t.Context()))
+}
+
+func TestLifecycleParallelStopReversesDAG(t *testing.T) {
+	t.Parallel()
+
+	l := New(testLogger(t), fxclock.System)
+	l.SetParallelism(2)
+	l.SetDependencies(map[int][]int{3: {1, 2}})
+
+	dependentStopped := make(chan struct{})
+	branchesStopped := make(chan struct{})
+	var stopped int
+	var mu sync.Mutex
+	for owner := 1; owner <= 2; owner++ {
+		l.AppendWithOwner(Hook{OnStop: func(context.Context) error {
+			select {
+			case <-dependentStopped:
+			default:
+				return errors.New("dependency stopped before dependent")
+			}
+			mu.Lock()
+			stopped++
+			if stopped == 2 {
+				close(branchesStopped)
+			}
+			mu.Unlock()
+			return nil
+		}}, owner)
+	}
+	l.AppendWithOwner(Hook{OnStop: func(context.Context) error {
+		close(dependentStopped)
+		return nil
+	}}, 3)
+
+	require.NoError(t, l.Start(t.Context()))
+	require.NoError(t, l.Stop(t.Context()))
+	select {
+	case <-branchesStopped:
+	default:
+		t.Fatal("dependency stop hooks did not run")
+	}
+}
+
+func TestLifecycleParallelPreservesOwnerHookOrder(t *testing.T) {
+	t.Parallel()
+
+	l := New(testLogger(t), fxclock.System)
+	l.SetParallelism(4)
+
+	var order []string
+	var mu sync.Mutex
+	appendOrder := func(value string) func(context.Context) error {
+		return func(context.Context) error {
+			mu.Lock()
+			order = append(order, value)
+			mu.Unlock()
+			return nil
+		}
+	}
+	l.AppendWithOwner(Hook{OnStart: appendOrder("start-1"), OnStop: appendOrder("stop-1")}, 1)
+	l.AppendWithOwner(Hook{OnStart: appendOrder("start-2"), OnStop: appendOrder("stop-2")}, 1)
+
+	require.NoError(t, l.Start(t.Context()))
+	require.NoError(t, l.Stop(t.Context()))
+	assert.Equal(t, []string{"start-1", "start-2", "stop-2", "stop-1"}, order)
+}
+
+func TestLifecycleParallelStartErrors(t *testing.T) {
+	t.Parallel()
+
+	l := New(testLogger(t), fxclock.System)
+	l.SetParallelism(2)
+	l.SetDependencies(map[int][]int{3: {1}})
+
+	ready := make(chan struct{})
+	var count int
+	var mu sync.Mutex
+	for owner, message := range []string{"first", "second"} {
+		owner, message := owner+1, message
+		l.AppendWithOwner(Hook{OnStart: func(context.Context) error {
+			mu.Lock()
+			count++
+			if count == 2 {
+				close(ready)
+			}
+			mu.Unlock()
+			<-ready
+			return errors.New(message)
+		}}, owner)
+	}
+	l.AppendWithOwner(Hook{OnStart: func(context.Context) error {
+		t.Fatal("dependent hook must not run")
+		return nil
+	}}, 3)
+	l.AppendWithOwner(Hook{OnStart: func(context.Context) error {
+		t.Fatal("queued independent hook must not run after an error")
+		return nil
+	}}, 4)
+
+	err := l.Start(t.Context())
+	require.EqualError(t, err, "first; second")
+}
+
+func TestLifecycleParallelCancellation(t *testing.T) {
+	t.Parallel()
+
+	l := New(testLogger(t), fxclock.System)
+	l.SetParallelism(2)
+	for owner := 1; owner <= 2; owner++ {
+		l.AppendWithOwner(Hook{OnStart: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}, owner)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	assert.ErrorIs(t, l.Start(ctx), context.DeadlineExceeded)
+	require.NoError(t, l.Stop(t.Context()))
+}
+
+func TestLifecycleParallelStopCancellation(t *testing.T) {
+	t.Parallel()
+
+	l := New(testLogger(t), fxclock.System)
+	l.SetParallelism(2)
+	for owner := 1; owner <= 2; owner++ {
+		l.AppendWithOwner(Hook{OnStop: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}, owner)
+	}
+
+	require.NoError(t, l.Start(t.Context()))
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	assert.ErrorIs(t, l.Stop(ctx), context.DeadlineExceeded)
+}
+
+func TestLifecycleParallelUnknownHookIsBarrier(t *testing.T) {
+	t.Parallel()
+
+	l := New(testLogger(t), fxclock.System)
+	l.SetParallelism(2)
+
+	branchesReady := make(chan struct{})
+	var ready int
+	var mu sync.Mutex
+	for owner := 1; owner <= 2; owner++ {
+		l.AppendWithOwner(Hook{OnStart: func(context.Context) error {
+			mu.Lock()
+			ready++
+			if ready == 2 {
+				close(branchesReady)
+			}
+			mu.Unlock()
+			<-branchesReady
+			return nil
+		}}, owner)
+	}
+
+	barrierDone := make(chan struct{})
+	l.Append(Hook{OnStart: func(context.Context) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if ready != 2 {
+			return errors.New("barrier ran before earlier hooks completed")
+		}
+		close(barrierDone)
+		return nil
+	}})
+	l.AppendWithOwner(Hook{OnStart: func(context.Context) error {
+		select {
+		case <-barrierDone:
+			return nil
+		default:
+			return errors.New("later hook ran before barrier")
+		}
+	}}, 3)
+
+	require.NoError(t, l.Start(t.Context()))
+	require.NoError(t, l.Stop(t.Context()))
+}
+
+func TestLifecycleParallelStopGathersErrorsAndContinues(t *testing.T) {
+	t.Parallel()
+
+	l := New(testLogger(t), fxclock.System)
+	l.SetParallelism(2)
+	l.SetDependencies(map[int][]int{3: {1, 2}})
+
+	for owner, message := range []string{"dependency-1", "dependency-2"} {
+		l.AppendWithOwner(Hook{OnStop: func(context.Context) error {
+			return errors.New(message)
+		}}, owner+1)
+	}
+	l.AppendWithOwner(Hook{OnStop: func(context.Context) error {
+		return errors.New("dependent")
+	}}, 3)
+
+	require.NoError(t, l.Start(t.Context()))
+	require.EqualError(t, l.Stop(t.Context()), "dependent; dependency-2; dependency-1")
 }
 
 func TestHookRecordsFormat(t *testing.T) {

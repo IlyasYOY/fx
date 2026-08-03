@@ -158,6 +158,33 @@ func (t stopTimeoutOption) String() string {
 	return fmt.Sprintf("fx.StopTimeout(%v)", time.Duration(t))
 }
 
+// ParallelHooks sets the maximum number of lifecycle hooks that Fx may run
+// concurrently. Hooks are only run concurrently when their constructors are
+// in independent branches of the dependency graph.
+//
+// The default is 1, which preserves Fx's sequential lifecycle behavior.
+func ParallelHooks(n int) Option {
+	return parallelHooksOption(n)
+}
+
+type parallelHooksOption int
+
+func (o parallelHooksOption) apply(m *module) {
+	switch {
+	case m.parent != nil:
+		m.app.err = fmt.Errorf("fx.ParallelHooks Option should be passed to top-level App, " +
+			"not to fx.Module")
+	case o <= 0:
+		m.app.err = fmt.Errorf("fx.ParallelHooks requires a positive limit, got %d", o)
+	default:
+		m.app.parallelHooks = int(o)
+	}
+}
+
+func (o parallelHooksOption) String() string {
+	return fmt.Sprintf("fx.ParallelHooks(%d)", o)
+}
+
 // RecoverFromPanics causes panics that occur in functions given to [Provide],
 // [Decorate], and [Invoke] to be recovered from.
 // This error can be retrieved as any other error, by using (*App).Err().
@@ -286,8 +313,10 @@ var NopLogger = WithLogger(func() fxevent.Logger { return fxevent.NopLogger })
 // Once all the invocations (and any required constructors) have been called,
 // New returns and the application is ready to be started using Run or Start.
 // On startup, it executes any OnStart hooks registered with its Lifecycle.
-// OnStart hooks are executed one at a time, in order, and must all complete
-// within a configurable deadline (by default, 15 seconds). For details on the
+// By default, OnStart hooks are executed one at a time, in order. Applications
+// may opt into dependency-aware parallel execution with [ParallelHooks]. All
+// hooks must complete within a configurable deadline (by default, 15 seconds).
+// For details on the
 // order in which OnStart hooks are executed, see the documentation for the
 // Start method.
 //
@@ -306,8 +335,9 @@ type App struct {
 	root      *module
 
 	// Timeouts used
-	startTimeout time.Duration
-	stopTimeout  time.Duration
+	startTimeout  time.Duration
+	stopTimeout   time.Duration
+	parallelHooks int
 	// Decides how we react to errors when building the graph.
 	errorHooks []ErrorHandler
 	validate   bool
@@ -423,10 +453,11 @@ func New(opts ...Option) *App {
 	logger := fxlog.DefaultLogger(os.Stderr)
 
 	app := &App{
-		clock:        fxclock.System,
-		startTimeout: DefaultTimeout,
-		stopTimeout:  DefaultTimeout,
-		receivers:    newSignalReceivers(),
+		clock:         fxclock.System,
+		startTimeout:  DefaultTimeout,
+		stopTimeout:   DefaultTimeout,
+		parallelHooks: 1,
+		receivers:     newSignalReceivers(),
 	}
 	app.root = &module{
 		app: app,
@@ -459,9 +490,10 @@ func New(opts ...Option) *App {
 	//   the public fx.Hook type.
 	// - appLogger ensures that the lifecycle always logs events to the
 	//   "current" logger associated with the fx.App.
-	app.lifecycle = &lifecycleWrapper{
+	app.lifecycle = newLifecycleWrapper(
 		lifecycle.New(appLogger{app}, app.clock),
-	}
+		app.parallelHooks,
+	)
 
 	containerOptions := []dig.Option{
 		dig.DeferAcyclicVerification(),
@@ -649,11 +681,12 @@ var (
 // hooks. Because initialization calls constructors serially and in dependency
 // order, hooks are naturally registered in serial and dependency order too.
 //
-// Start executes all OnStart hooks registered with the application's
-// Lifecycle, one at a time and in order. This ensures that each constructor's
-// start hooks aren't executed until all its dependencies' start hooks
-// complete. If any of the start hooks return an error, Start short-circuits,
-// calls Stop, and returns the inciting error.
+// By default, Start executes all OnStart hooks registered with the application's
+// Lifecycle, one at a time and in order. With [ParallelHooks], independent
+// branches of the dependency graph may run concurrently while each
+// constructor's hooks still wait for all its dependencies' hooks. If any start
+// hook returns an error, Start stops scheduling new hooks, waits for hooks that
+// are already running, calls Stop, and returns the collected errors.
 //
 // Note that Start short-circuits immediately if the New constructor
 // encountered any errors in application initialization.

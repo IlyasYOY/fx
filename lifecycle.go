@@ -135,13 +135,27 @@ func StartStopHook[T1 HookFunc, T2 HookFunc](start T1, stop T2) Hook {
 
 type lifecycleWrapper struct {
 	*lifecycle.Lifecycle
+	graph *hookGraph
+}
+
+func newLifecycleWrapper(lc *lifecycle.Lifecycle, parallelism int) *lifecycleWrapper {
+	lc.SetParallelism(parallelism)
+	return &lifecycleWrapper{
+		Lifecycle: lc,
+		graph:     newHookGraph(),
+	}
 }
 
 func (l *lifecycleWrapper) Append(h Hook) {
-	l.Lifecycle.Append(lifecycle.Hook{
+	l.AppendWithOwner(lifecycle.Hook{
 		OnStart:     h.OnStart,
 		OnStop:      h.OnStop,
 		OnStartName: h.onStartName,
 		OnStopName:  h.onStopName,
-	})
+	}, l.graph.currentOwner())
+}
+
+func (l *lifecycleWrapper) Start(ctx context.Context) error {
+	l.SetDependencies(l.graph.dependencies())
+	return l.Lifecycle.Start(ctx)
 }

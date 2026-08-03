@@ -130,6 +130,7 @@ type module struct {
 	log            fxevent.Logger
 	fallbackLogger fxevent.Logger
 	logConstructor *provide
+	hookScope      *hookScope
 }
 
 // scope is a private wrapper interface for dig.Container and dig.Scope.
@@ -150,9 +151,11 @@ type scope interface {
 func (m *module) build(app *App, root *dig.Container) {
 	if m.parent == nil {
 		m.scope = root
+		m.hookScope = app.lifecycle.graph.root
 	} else {
 		parentScope := m.parent.scope
 		m.scope = parentScope.Scope(m.name)
+		m.hookScope = app.lifecycle.graph.newScope(m.parent.hookScope)
 		// use parent module's logger by default
 		m.log = m.parent.log
 	}
@@ -191,11 +194,13 @@ func (m *module) provide(p provide) {
 	}
 
 	funcName := fxreflect.FuncName(p.Target)
+	component := m.app.lifecycle.graph.newComponent(m.hookScope, hookProvider)
 	var info dig.ProvideInfo
 	opts := []dig.ProvideOption{
 		dig.FillProvideInfo(&info),
 		dig.Export(!p.Private),
 		dig.WithProviderBeforeCallback(func(bci dig.BeforeCallbackInfo) {
+			m.app.lifecycle.graph.begin(component)
 			m.log.LogEvent(&fxevent.BeforeRun{
 				Name:       funcName,
 				Kind:       "provide",
@@ -203,6 +208,7 @@ func (m *module) provide(p provide) {
 			})
 		}),
 		dig.WithProviderCallback(func(ci dig.CallbackInfo) {
+			defer m.app.lifecycle.graph.end(component)
 			m.log.LogEvent(&fxevent.Run{
 				Name:       funcName,
 				Kind:       "provide",
@@ -216,6 +222,7 @@ func (m *module) provide(p provide) {
 	if err := runProvide(m.scope, p, opts...); err != nil {
 		m.app.err = err
 	}
+	m.app.lifecycle.graph.setProvideInfo(component, info, !p.Private)
 	outputNames := make([]string, len(info.Outputs))
 	for i, o := range info.Outputs {
 		outputNames[i] = o.String()
@@ -234,9 +241,13 @@ func (m *module) provide(p provide) {
 
 func (m *module) supply(p provide) {
 	typeName := p.SupplyType.String()
+	component := m.app.lifecycle.graph.newComponent(m.hookScope, hookProvider)
+	var info dig.ProvideInfo
 	opts := []dig.ProvideOption{
+		dig.FillProvideInfo(&info),
 		dig.Export(!p.Private),
 		dig.WithProviderBeforeCallback(func(bci dig.BeforeCallbackInfo) {
+			m.app.lifecycle.graph.begin(component)
 			m.log.LogEvent(&fxevent.BeforeRun{
 				Name:       fmt.Sprintf("stub(%v)", typeName),
 				Kind:       "supply",
@@ -244,6 +255,7 @@ func (m *module) supply(p provide) {
 			})
 		}),
 		dig.WithProviderCallback(func(ci dig.CallbackInfo) {
+			defer m.app.lifecycle.graph.end(component)
 			m.log.LogEvent(&fxevent.Run{
 				Name:       fmt.Sprintf("stub(%v)", typeName),
 				Kind:       "supply",
@@ -256,6 +268,7 @@ func (m *module) supply(p provide) {
 	if err := runProvide(m.scope, p, opts...); err != nil {
 		m.app.err = err
 	}
+	m.app.lifecycle.graph.setProvideInfo(component, info, !p.Private)
 
 	m.log.LogEvent(&fxevent.Supplied{
 		TypeName:    typeName,
@@ -290,6 +303,7 @@ func (m *module) installAllEventLoggers() {
 func (m *module) installEventLogger(buffer *logBuffer) (err error) {
 	p := m.logConstructor
 	fname := fxreflect.FuncName(p.Target)
+	component := m.app.lifecycle.graph.newComponent(m.hookScope, hookProvider)
 	defer func() {
 		m.log.LogEvent(&fxevent.LoggerInitialized{
 			Err:             err,
@@ -297,12 +311,21 @@ func (m *module) installEventLogger(buffer *logBuffer) (err error) {
 		})
 	}()
 
-	// TODO: Use dig.FillProvideInfo to inspect the provided constructor
-	// and fail the application if its signature didn't match.
-	if err := m.scope.Provide(p.Target); err != nil {
+	var info dig.ProvideInfo
+	if err := m.scope.Provide(
+		p.Target,
+		dig.FillProvideInfo(&info),
+		dig.WithProviderBeforeCallback(func(dig.BeforeCallbackInfo) {
+			m.app.lifecycle.graph.begin(component)
+		}),
+		dig.WithProviderCallback(func(dig.CallbackInfo) {
+			m.app.lifecycle.graph.end(component)
+		}),
+	); err != nil {
 		return fmt.Errorf("fx.WithLogger(%v) from:\n%+v\nin Module: %q\nFailed: %w",
 			fname, p.Stack, m.name, err)
 	}
+	m.app.lifecycle.graph.setProvideInfo(component, info, false)
 
 	return m.scope.Invoke(func(log fxevent.Logger) {
 		m.log = log
@@ -328,11 +351,16 @@ func (m *module) invokeAll() error {
 
 func (m *module) invoke(i invoke) (err error) {
 	fnName := fxreflect.FuncName(i.Target)
+	component := m.app.lifecycle.graph.newComponent(m.hookScope, hookInvoke)
+	var info dig.InvokeInfo
 	m.log.LogEvent(&fxevent.Invoking{
 		FunctionName: fnName,
 		ModuleName:   m.name,
 	})
-	err = runInvoke(m.scope, i)
+	m.app.lifecycle.graph.begin(component)
+	err = runInvoke(m.scope, i, dig.FillInvokeInfo(&info))
+	m.app.lifecycle.graph.end(component)
+	m.app.lifecycle.graph.setInvokeInfo(component, info)
 	m.log.LogEvent(&fxevent.Invoked{
 		FunctionName: fnName,
 		ModuleName:   m.name,
@@ -363,10 +391,12 @@ func (m *module) decorate(d decorator) (err error) {
 	}
 
 	funcName := fxreflect.FuncName(d.Target)
+	component := m.app.lifecycle.graph.newComponent(m.hookScope, hookDecorator)
 	var info dig.DecorateInfo
 	opts := []dig.DecorateOption{
 		dig.FillDecorateInfo(&info),
 		dig.WithDecoratorBeforeCallback(func(bci dig.BeforeCallbackInfo) {
+			m.app.lifecycle.graph.begin(component)
 			m.log.LogEvent(&fxevent.BeforeRun{
 				Name:       funcName,
 				Kind:       "decorate",
@@ -374,6 +404,7 @@ func (m *module) decorate(d decorator) (err error) {
 			})
 		}),
 		dig.WithDecoratorCallback(func(ci dig.CallbackInfo) {
+			defer m.app.lifecycle.graph.end(component)
 			m.log.LogEvent(&fxevent.Run{
 				Name:       funcName,
 				Kind:       "decorate",
@@ -385,6 +416,7 @@ func (m *module) decorate(d decorator) (err error) {
 	}
 
 	err = runDecorator(m.scope, d, opts...)
+	m.app.lifecycle.graph.setDecorateInfo(component, info)
 	outputNames := make([]string, len(info.Outputs))
 	for i, o := range info.Outputs {
 		outputNames[i] = o.String()
@@ -404,8 +436,12 @@ func (m *module) decorate(d decorator) (err error) {
 
 func (m *module) replace(d decorator) error {
 	typeName := d.ReplaceType.String()
+	component := m.app.lifecycle.graph.newComponent(m.hookScope, hookDecorator)
+	var info dig.DecorateInfo
 	opts := []dig.DecorateOption{
+		dig.FillDecorateInfo(&info),
 		dig.WithDecoratorBeforeCallback(func(bci dig.BeforeCallbackInfo) {
+			m.app.lifecycle.graph.begin(component)
 			m.log.LogEvent(&fxevent.BeforeRun{
 				Name:       fmt.Sprintf("stub(%v)", typeName),
 				Kind:       "replace",
@@ -413,6 +449,7 @@ func (m *module) replace(d decorator) error {
 			})
 		}),
 		dig.WithDecoratorCallback(func(ci dig.CallbackInfo) {
+			defer m.app.lifecycle.graph.end(component)
 			m.log.LogEvent(&fxevent.Run{
 				Name:       fmt.Sprintf("stub(%v)", typeName),
 				Kind:       "replace",
@@ -424,6 +461,7 @@ func (m *module) replace(d decorator) error {
 	}
 
 	err := runDecorator(m.scope, d, opts...)
+	m.app.lifecycle.graph.setDecorateInfo(component, info)
 	m.log.LogEvent(&fxevent.Replaced{
 		ModuleName:      m.name,
 		StackTrace:      d.Stack.Strings(),
