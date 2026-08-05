@@ -475,10 +475,10 @@ func (l *Lifecycle) runStartSegment(
 	ownerDeps map[int][]int,
 	parallelism int,
 ) ([]indexedError, error) {
-	jobs := groupHookIndices(hooks, indices)
-	indegree, next := segmentEdges(jobs, ownerDeps, false)
-	ready := readyOwners(jobs, indegree, false)
-	results := make(chan ownerResult, len(jobs))
+	hooksByOwner := groupHookIndicesByOwner(hooks, indices)
+	remainingPrerequisites, successorsByOwner := segmentEdges(hooksByOwner, ownerDeps, false)
+	readyOwners := filterReadyOwners(hooksByOwner, remainingPrerequisites, false)
+	results := make(chan ownerResult, len(hooksByOwner))
 
 	var (
 		running  int
@@ -486,14 +486,14 @@ func (l *Lifecycle) runStartSegment(
 		failed   bool
 		errs     []indexedError
 	)
-	for running > 0 || (!failed && len(ready) > 0) {
-		for !failed && ctx.Err() == nil && running < parallelism && len(ready) > 0 {
-			owner := ready[0]
-			ready = ready[1:]
+	for running > 0 || (!failed && len(readyOwners) > 0) {
+		for !failed && ctx.Err() == nil && running < parallelism && len(readyOwners) > 0 {
+			owner := readyOwners[0]
+			readyOwners = readyOwners[1:]
 			running++
 			launched++
 			go func() {
-				results <- l.runStartOwner(ctx, hooks, jobs[owner], owner)
+				results <- l.runStartOwner(ctx, hooks, hooksByOwner[owner], owner)
 			}()
 		}
 
@@ -507,19 +507,19 @@ func (l *Lifecycle) runStartSegment(
 			errs = append(errs, result.errs...)
 			continue
 		}
-		for _, dependent := range next[result.owner] {
-			indegree[dependent]--
-			if indegree[dependent] == 0 {
-				ready = append(ready, dependent)
+		for _, successor := range successorsByOwner[result.owner] {
+			remainingPrerequisites[successor]--
+			if remainingPrerequisites[successor] == 0 {
+				readyOwners = append(readyOwners, successor)
 			}
 		}
-		sortOwners(ready, jobs, false)
+		sortOwners(readyOwners, hooksByOwner, false)
 	}
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !failed && launched != len(jobs) {
+	if !failed && launched != len(hooksByOwner) {
 		return nil, errors.New("lifecycle hook dependency graph contains a cycle")
 	}
 	return errs, nil
@@ -616,22 +616,22 @@ func (l *Lifecycle) runStopSegment(
 	ownerDeps map[int][]int,
 	parallelism int,
 ) ([]indexedError, error) {
-	jobs := groupHookIndices(hooks, indices)
-	indegree, next := segmentEdges(jobs, ownerDeps, true)
-	ready := readyOwners(jobs, indegree, true)
-	results := make(chan ownerResult, len(jobs))
+	hooksByOwner := groupHookIndicesByOwner(hooks, indices)
+	remainingPrerequisites, successorsByOwner := segmentEdges(hooksByOwner, ownerDeps, true)
+	readyOwners := filterReadyOwners(hooksByOwner, remainingPrerequisites, true)
+	results := make(chan ownerResult, len(hooksByOwner))
 	var (
 		running   int
 		completed int
 		errs      []indexedError
 	)
-	for running > 0 || len(ready) > 0 {
-		for ctx.Err() == nil && running < parallelism && len(ready) > 0 {
-			owner := ready[0]
-			ready = ready[1:]
+	for running > 0 || len(readyOwners) > 0 {
+		for ctx.Err() == nil && running < parallelism && len(readyOwners) > 0 {
+			owner := readyOwners[0]
+			readyOwners = readyOwners[1:]
 			running++
 			go func() {
-				results <- l.runStopOwner(ctx, hooks, jobs[owner], owner)
+				results <- l.runStopOwner(ctx, hooks, hooksByOwner[owner], owner)
 			}()
 		}
 		if running == 0 {
@@ -642,18 +642,18 @@ func (l *Lifecycle) runStopSegment(
 		running--
 		completed++
 		errs = append(errs, result.errs...)
-		for _, dependent := range next[result.owner] {
-			indegree[dependent]--
-			if indegree[dependent] == 0 {
-				ready = append(ready, dependent)
+		for _, successor := range successorsByOwner[result.owner] {
+			remainingPrerequisites[successor]--
+			if remainingPrerequisites[successor] == 0 {
+				readyOwners = append(readyOwners, successor)
 			}
 		}
-		sortOwners(ready, jobs, true)
+		sortOwners(readyOwners, hooksByOwner, true)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if completed != len(jobs) {
+	if completed != len(hooksByOwner) {
 		return nil, errors.New("lifecycle hook dependency graph contains a cycle")
 	}
 	return errs, nil
@@ -710,10 +710,10 @@ func splitHookParts(hooks []hookEntry) []hookPart {
 			return
 		}
 		parts = append(parts, hookPart{
-			indices: append([]int(nil), indices...),
+			indices: indices,
 			barrier: barrier,
 		})
-		indices = indices[:0]
+		indices = nil
 	}
 	for index, hook := range hooks {
 		if hook.owner == 0 {
@@ -726,7 +726,7 @@ func splitHookParts(hooks []hookEntry) []hookPart {
 	return parts
 }
 
-func groupHookIndices(hooks []hookEntry, indices []int) map[int][]int {
+func groupHookIndicesByOwner(hooks []hookEntry, indices []int) map[int][]int {
 	jobs := make(map[int][]int)
 	for _, index := range indices {
 		owner := hooks[index].owner
@@ -771,36 +771,45 @@ func lifecycleOwnerDependencies(hooks []hookEntry, dependencies map[int][]int) m
 	return result
 }
 
+// segmentEdges builds the dependency graph for the owners in a hook segment.
+// Dependencies outside the segment are ignored because their hooks are ordered
+// by another segment. For start hooks, edges point from each dependency to the
+// owner that waits for it. When reverse is true, the edges point in the opposite
+// direction so stop hooks run before the owners they depend on.
+//
+// It returns the number of incoming edges for each owner and an adjacency list
+// mapping each owner to the owners that become eligible after it completes.
 func segmentEdges(
-	jobs map[int][]int,
+	hooksByOwner map[int][]int,
 	ownerDeps map[int][]int,
 	reverse bool,
 ) (map[int]int, map[int][]int) {
-	indegree := make(map[int]int, len(jobs))
-	next := make(map[int][]int, len(jobs))
-	for owner := range jobs {
-		indegree[owner] = 0
+	remainingPrerequisites := make(map[int]int, len(hooksByOwner))
+	successorsByOwner := make(map[int][]int, len(hooksByOwner))
+	for owner := range hooksByOwner {
+		remainingPrerequisites[owner] = 0
 	}
-	for owner := range jobs {
+
+	for owner := range hooksByOwner {
 		for _, dependency := range ownerDeps[owner] {
-			if _, ok := jobs[dependency]; !ok {
+			if _, ok := hooksByOwner[dependency]; !ok {
 				continue
 			}
 			from, to := dependency, owner
 			if reverse {
 				from, to = to, from
 			}
-			next[from] = append(next[from], to)
-			indegree[to]++
+			successorsByOwner[from] = append(successorsByOwner[from], to)
+			remainingPrerequisites[to]++
 		}
 	}
-	return indegree, next
+	return remainingPrerequisites, successorsByOwner
 }
 
-func readyOwners(jobs map[int][]int, indegree map[int]int, reverse bool) []int {
+func filterReadyOwners(jobs map[int][]int, remainingPrerequisites map[int]int, reverse bool) []int {
 	ready := make([]int, 0, len(jobs))
 	for owner := range jobs {
-		if indegree[owner] == 0 {
+		if remainingPrerequisites[owner] == 0 {
 			ready = append(ready, owner)
 		}
 	}
