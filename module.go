@@ -219,10 +219,9 @@ func (m *module) provide(p provide) {
 		}),
 	}
 
-	if err := runProvide(m.scope, p, opts...); err != nil {
+	if err := runProvide(m.app.lifecycle.graph.container(m.scope, component, !p.Private), p, opts...); err != nil {
 		m.app.err = err
 	}
-	m.app.lifecycle.graph.setProvideInfo(component, info, !p.Private)
 	outputNames := make([]string, len(info.Outputs))
 	for i, o := range info.Outputs {
 		outputNames[i] = o.String()
@@ -265,10 +264,9 @@ func (m *module) supply(p provide) {
 		}),
 	}
 
-	if err := runProvide(m.scope, p, opts...); err != nil {
+	if err := runProvide(m.app.lifecycle.graph.container(m.scope, component, !p.Private), p, opts...); err != nil {
 		m.app.err = err
 	}
-	m.app.lifecycle.graph.setProvideInfo(component, info, !p.Private)
 
 	m.log.LogEvent(&fxevent.Supplied{
 		TypeName:    typeName,
@@ -312,7 +310,7 @@ func (m *module) installEventLogger(buffer *logBuffer) (err error) {
 	}()
 
 	var info dig.ProvideInfo
-	if err := m.scope.Provide(
+	if err := m.app.lifecycle.graph.container(m.scope, component, false).Provide(
 		p.Target,
 		dig.FillProvideInfo(&info),
 		dig.WithProviderBeforeCallback(func(dig.BeforeCallbackInfo) {
@@ -325,7 +323,6 @@ func (m *module) installEventLogger(buffer *logBuffer) (err error) {
 		return fmt.Errorf("fx.WithLogger(%v) from:\n%+v\nin Module: %q\nFailed: %w",
 			fname, p.Stack, m.name, err)
 	}
-	m.app.lifecycle.graph.setProvideInfo(component, info, false)
 
 	return m.scope.Invoke(func(log fxevent.Logger) {
 		m.log = log
@@ -358,9 +355,8 @@ func (m *module) invoke(i invoke) (err error) {
 		ModuleName:   m.name,
 	})
 	m.app.lifecycle.graph.begin(component)
-	err = runInvoke(m.scope, i, dig.FillInvokeInfo(&info))
+	err = runInvoke(m.app.lifecycle.graph.container(m.scope, component, false), i, dig.FillInvokeInfo(&info))
 	m.app.lifecycle.graph.end(component)
-	m.app.lifecycle.graph.setInvokeInfo(component, info)
 	m.log.LogEvent(&fxevent.Invoked{
 		FunctionName: fnName,
 		ModuleName:   m.name,
@@ -415,8 +411,7 @@ func (m *module) decorate(d decorator) (err error) {
 		}),
 	}
 
-	err = runDecorator(m.scope, d, opts...)
-	m.app.lifecycle.graph.setDecorateInfo(component, info)
+	err = runDecorator(m.app.lifecycle.graph.container(m.scope, component, false), d, opts...)
 	outputNames := make([]string, len(info.Outputs))
 	for i, o := range info.Outputs {
 		outputNames[i] = o.String()
@@ -460,8 +455,7 @@ func (m *module) replace(d decorator) error {
 		}),
 	}
 
-	err := runDecorator(m.scope, d, opts...)
-	m.app.lifecycle.graph.setDecorateInfo(component, info)
+	err := runDecorator(m.app.lifecycle.graph.container(m.scope, component, false), d, opts...)
 	m.log.LogEvent(&fxevent.Replaced{
 		ModuleName:      m.name,
 		StackTrace:      d.Stack.Strings(),

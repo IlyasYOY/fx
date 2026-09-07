@@ -147,6 +147,11 @@ func runProvide(c container, p provide, opts ...dig.ProvideOption) error {
 
 	case Annotated:
 		ann := constructor
+		// Dig options are opaque. Carry legacy annotations explicitly to
+		// the lifecycle graph adapter alongside the actual Dig options.
+		if tracked, ok := c.(*hookContainer); ok {
+			tracked.name, tracked.group = ann.Name, ann.Group
+		}
 		switch {
 		case len(ann.Group) > 0 && len(ann.Name) > 0:
 			return fmt.Errorf(

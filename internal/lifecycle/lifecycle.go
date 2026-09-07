@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/fx/fxevent"
@@ -36,6 +37,9 @@ import (
 	"go.uber.org/fx/internal/fxreflect"
 	"go.uber.org/multierr"
 )
+
+// ErrHookCallbackExited is returned when a hook goroutine exits without returning.
+var ErrHookCallbackExited = errors.New("goroutine exited without returning")
 
 // Reflection types for each of the supported hook function signatures. These
 // are used in cases in which the Callable constraint matches a user-defined
@@ -274,7 +278,7 @@ func (l *Lifecycle) startSequential(ctx context.Context) error {
 			l.runningHook = hook
 			l.mu.Unlock()
 
-			runtime, err := l.runStartHook(ctx, hook)
+			runtime, err := l.runStartHook(ctx, hook, nil)
 			if err != nil {
 				return err
 			}
@@ -295,7 +299,7 @@ func (l *Lifecycle) startSequential(ctx context.Context) error {
 	return nil
 }
 
-func (l *Lifecycle) runStartHook(ctx context.Context, hook Hook) (runtime time.Duration, err error) {
+func (l *Lifecycle) runStartHook(ctx context.Context, hook Hook, failed *atomic.Bool) (runtime time.Duration, err error) {
 	funcName := hook.OnStartName
 	if len(funcName) == 0 {
 		funcName = fxreflect.FuncName(hook.OnStart)
@@ -305,7 +309,12 @@ func (l *Lifecycle) runStartHook(ctx context.Context, hook Hook) (runtime time.D
 		CallerName:   hook.callerFrame.Function,
 		FunctionName: funcName,
 	})
+	returned := false
 	defer func() {
+		if !returned && failed != nil {
+			err = ErrHookCallbackExited
+			failed.Store(true)
+		}
 		l.logEvent(&fxevent.OnStartExecuted{
 			CallerName:   hook.callerFrame.Function,
 			FunctionName: funcName,
@@ -316,6 +325,10 @@ func (l *Lifecycle) runStartHook(ctx context.Context, hook Hook) (runtime time.D
 
 	begin := l.clock.Now()
 	err = hook.OnStart(ctx)
+	if err != nil && failed != nil {
+		failed.Store(true)
+	}
+	returned = true
 	return l.clock.Since(begin), err
 }
 
@@ -452,7 +465,7 @@ func (l *Lifecycle) startParallel(ctx context.Context) error {
 			}
 		}
 		if part.barrier >= 0 {
-			result := l.runStartOwner(ctx, hooks, []int{part.barrier}, 0)
+			result := l.runStartOwner(ctx, hooks, []int{part.barrier}, 0, nil, nil)
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -483,18 +496,16 @@ func (l *Lifecycle) runStartSegment(
 	var (
 		running  int
 		launched int
-		failed   bool
+		failed   atomic.Bool
 		errs     []indexedError
 	)
-	for running > 0 || (!failed && len(readyOwners) > 0) {
-		for !failed && ctx.Err() == nil && running < parallelism && len(readyOwners) > 0 {
+	for running > 0 || (!failed.Load() && len(readyOwners) > 0) {
+		for !failed.Load() && ctx.Err() == nil && running < parallelism && len(readyOwners) > 0 {
 			owner := readyOwners[0]
 			readyOwners = readyOwners[1:]
 			running++
 			launched++
-			go func() {
-				results <- l.runStartOwner(ctx, hooks, hooksByOwner[owner], owner)
-			}()
+			go l.runStartOwner(ctx, hooks, hooksByOwner[owner], owner, &failed, results)
 		}
 
 		if running == 0 {
@@ -503,7 +514,7 @@ func (l *Lifecycle) runStartSegment(
 		result := <-results
 		running--
 		if len(result.errs) > 0 {
-			failed = true
+			failed.Store(true)
 			errs = append(errs, result.errs...)
 			continue
 		}
@@ -519,7 +530,7 @@ func (l *Lifecycle) runStartSegment(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !failed && launched != len(hooksByOwner) {
+	if !failed.Load() && launched != len(hooksByOwner) {
 		return nil, errors.New("lifecycle hook dependency graph contains a cycle")
 	}
 	return errs, nil
@@ -532,9 +543,28 @@ func (l *Lifecycle) runStartOwner(
 	hooks []hookEntry,
 	indices []int,
 	owner int,
-) ownerResult {
-	result := ownerResult{owner: owner}
+	failed *atomic.Bool,
+	results chan<- ownerResult,
+) (result ownerResult) {
+	result.owner = owner
+	active := -1
+	defer func() {
+		// Goexit runs defers but never returns to the scheduler's caller.
+		// Keep both the accumulated result and its delivery in this frame.
+		if active >= 0 {
+			result.errs = append(result.errs, indexedError{index: active, err: ErrHookCallbackExited})
+			if failed != nil {
+				failed.Store(true)
+			}
+		}
+		if results != nil {
+			results <- result
+		}
+	}()
 	for _, index := range indices {
+		if failed != nil && failed.Load() {
+			return result
+		}
 		if err := ctx.Err(); err != nil {
 			result.errs = append(result.errs, indexedError{index: index, err: err})
 			return result
@@ -546,7 +576,9 @@ func (l *Lifecycle) runStartOwner(
 			l.runningHook = hook
 			l.mu.Unlock()
 
-			runtime, err := l.runStartHook(ctx, hook)
+			active = index
+			runtime, err := l.runStartHook(ctx, hook, failed)
+			active = -1
 			if err != nil {
 				result.errs = append(result.errs, indexedError{index: index, err: err})
 				return result
@@ -584,7 +616,7 @@ func (l *Lifecycle) stopParallel(ctx context.Context) error {
 	for i := len(parts) - 1; i >= 0; i-- {
 		part := parts[i]
 		if part.barrier >= 0 && hooks[part.barrier].started {
-			result := l.runStopOwner(ctx, hooks, []int{part.barrier}, 0)
+			result := l.runStopOwner(ctx, hooks, []int{part.barrier}, 0, nil)
 			errs = append(errs, result.errs...)
 			if err := ctx.Err(); err != nil {
 				return err
@@ -630,9 +662,7 @@ func (l *Lifecycle) runStopSegment(
 			owner := readyOwners[0]
 			readyOwners = readyOwners[1:]
 			running++
-			go func() {
-				results <- l.runStopOwner(ctx, hooks, hooksByOwner[owner], owner)
-			}()
+			go l.runStopOwner(ctx, hooks, hooksByOwner[owner], owner, results)
 		}
 		if running == 0 {
 			break
@@ -664,8 +694,19 @@ func (l *Lifecycle) runStopOwner(
 	hooks []hookEntry,
 	indices []int,
 	owner int,
-) ownerResult {
-	result := ownerResult{owner: owner}
+	results chan<- ownerResult,
+) (result ownerResult) {
+	result.owner = owner
+	active := -1
+	defer func() {
+		// Preserve earlier stop errors if this owner's active hook exits.
+		if active >= 0 {
+			result.errs = append(result.errs, indexedError{index: active, err: ErrHookCallbackExited})
+		}
+		if results != nil {
+			results <- result
+		}
+	}()
 	for i := len(indices) - 1; i >= 0; i-- {
 		index := indices[i]
 		if err := ctx.Err(); err != nil {
@@ -681,7 +722,9 @@ func (l *Lifecycle) runStopOwner(
 		l.runningHook = hook
 		l.mu.Unlock()
 
+		active = index
 		runtime, err := l.runStopHook(ctx, hook)
+		active = -1
 		if err != nil {
 			result.errs = append(result.errs, indexedError{index: index, err: err})
 		}

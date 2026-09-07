@@ -815,7 +815,7 @@ type withTimeoutParams struct {
 }
 
 // errHookCallbackExited is returned when a hook callback does not finish executing
-var errHookCallbackExited = errors.New("goroutine exited without returning")
+var errHookCallbackExited = lifecycle.ErrHookCallbackExited
 
 func withTimeout(ctx context.Context, param *withTimeoutParams) error {
 	c := make(chan error, 1)
