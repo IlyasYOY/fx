@@ -80,6 +80,48 @@ func validateTestApp(tb testing.TB, opts ...Option) error {
 	return ValidateApp(opts...)
 }
 
+func registerCallerAttributionHooks(lc Lifecycle) {
+	lc.Append(Hook{
+		OnStart: func(context.Context) error { return nil },
+		OnStop:  func(context.Context) error { return nil },
+	})
+}
+
+func TestLifecycleCallerAttribution(t *testing.T) {
+	t.Parallel()
+
+	for _, parallel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("parallel=%v", parallel), func(t *testing.T) {
+			t.Parallel()
+			opts := []Option{Invoke(registerCallerAttributionHooks)}
+			if parallel {
+				opts = append(opts, ParallelHooks(2))
+			}
+			app, spy := NewSpied(opts...)
+			require.NoError(t, app.Err())
+			spy.Reset()
+			require.NoError(t, app.Start(context.Background()))
+			require.NoError(t, app.Stop(context.Background()))
+
+			const caller = "go.uber.org/fx_test.registerCallerAttributionHooks"
+			var callers []string
+			for _, event := range spy.Events() {
+				switch event := event.(type) {
+				case *fxevent.OnStartExecuting:
+					callers = append(callers, event.CallerName)
+				case *fxevent.OnStartExecuted:
+					callers = append(callers, event.CallerName)
+				case *fxevent.OnStopExecuting:
+					callers = append(callers, event.CallerName)
+				case *fxevent.OnStopExecuted:
+					callers = append(callers, event.CallerName)
+				}
+			}
+			assert.Equal(t, []string{caller, caller, caller, caller}, callers)
+		})
+	}
+}
+
 func TestNewApp(t *testing.T) {
 	t.Parallel()
 

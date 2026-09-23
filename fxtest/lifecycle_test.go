@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,33 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/goleak"
 )
+
+func registerCallerAttributionHooks(lc fx.Lifecycle) {
+	lc.Append(fx.Hook{
+		OnStart: func(context.Context) error { return nil },
+		OnStop:  func(context.Context) error { return nil },
+	})
+}
+
+func TestLifecycleCallerAttribution(t *testing.T) {
+	t.Parallel()
+
+	spy := newTB()
+	lc := NewLifecycle(spy)
+	registerCallerAttributionHooks(lc)
+	require.NoError(t, lc.Start(context.Background()))
+	require.NoError(t, lc.Stop(context.Background()))
+
+	const caller = "go.uber.org/fx/fxtest.registerCallerAttributionHooks"
+	logs := strings.FieldsFunc(spy.logs.String(), func(r rune) bool { return r == '\n' })
+	require.Len(t, logs, 4)
+	for i, phase := range []string{"OnStart", "OnStop"} {
+		assert.Contains(t, logs[2*i], "HOOK "+phase)
+		assert.Contains(t, logs[2*i], "executing (caller: "+caller+")")
+		assert.Contains(t, logs[2*i+1], "HOOK "+phase)
+		assert.Contains(t, logs[2*i+1], "called by "+caller+" ran successfully")
+	}
+}
 
 func TestLifecycle(t *testing.T) {
 	t.Parallel()

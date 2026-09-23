@@ -184,14 +184,19 @@ func New(logger fxevent.Logger, clock fxclock.Clock) *Lifecycle {
 
 // Append adds a Hook to the lifecycle.
 func (l *Lifecycle) Append(hook Hook) {
-	l.AppendWithOwner(hook, 0)
+	l.append(hook, 0)
 }
 
 // AppendWithOwner adds a Hook associated with a dependency graph component.
 // An owner of zero marks a hook whose graph ownership is unknown.
 func (l *Lifecycle) AppendWithOwner(hook Hook, owner int) {
+	l.append(hook, owner)
+}
+
+func (l *Lifecycle) append(hook Hook, owner int) {
 	// Save the caller's stack frame to report file/line number.
-	if f := fxreflect.CallerStack(2, 0); len(f) > 0 {
+	// Skip this helper, Append or AppendWithOwner, and the public lifecycle wrapper.
+	if f := fxreflect.CallerStack(3, 0); len(f) > 0 {
 		hook.callerFrame = f[0]
 	}
 	l.mu.Lock()
